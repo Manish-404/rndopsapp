@@ -1566,7 +1566,7 @@ def submit_commit_data(doctype, frapAppId, name, project_name, commit_amount, bu
         return {"status": "error", "message": str(e)}
 
 
-def check_workflow_and_publish(doc, method=None):
+def check_workflow_and_publish(doc, method=None, staging_names=None, force=False):
     """
     Centralized workflow hook to publish staged commit data when the document reaches
     the trigger_state stored inside each Kafka Commit Staging payload.
@@ -1576,10 +1576,16 @@ def check_workflow_and_publish(doc, method=None):
     its workflow_state matches the trigger_state in that staging row's payload.
     Default trigger_state is "Approved" (backward-compatible with all existing modules).
     ICSS uses trigger_state="Pending PO Generation".
+
+    staging_names: restrict to these Kafka Commit Staging rows (published in creation order).
+    force: publish the selected rows regardless of their trigger_state / idempotency guard
+    (used when the caller names the rows explicitly, e.g. Direct Purchase 'POGenerated').
+    Returns the list of staging names that failed to publish.
     """
+    failed = []
     current_state = doc.get("workflow_state")
     if not current_state:
-        return
+        return failed
 
     print(f"[CHECK_WORKFLOW] doctype={doc.doctype} name={doc.name} current_state={current_state}")
 
@@ -1588,15 +1594,19 @@ def check_workflow_and_publish(doc, method=None):
     print(f"[CHECK_WORKFLOW] prev_state={prev_state}")
 
     # Look for all pending/failed staging docs for this document
-    staging_docs = frappe.get_all("Kafka Commit Staging", filters={
-        "reference_doctype": doc.doctype,
-        "reference_name": doc.name,
-        "status": ["in", ["PENDING_APPROVAL", "FAILED"]]
-    })
+    # When the caller names rows explicitly it has already validated ownership (this lets
+    # legacy rows staged under "<name>-po" be published); otherwise match by reference.
+    staging_filters = {"status": ["in", ["PENDING_APPROVAL", "FAILED"]]}
+    if staging_names:
+        staging_filters["name"] = ["in", list(staging_names)]
+    else:
+        staging_filters["reference_doctype"] = doc.doctype
+        staging_filters["reference_name"] = doc.name
+    staging_docs = frappe.get_all("Kafka Commit Staging", filters=staging_filters, order_by="creation asc")
     print(f"[CHECK_WORKFLOW] Found {len(staging_docs)} staging doc(s) for {doc.doctype}/{doc.name}")
 
     if not staging_docs:
-        return
+        return failed
 
     for st in staging_docs:
         staging_doc = frappe.get_doc("Kafka Commit Staging", st.name)
@@ -1608,12 +1618,12 @@ def check_workflow_and_publish(doc, method=None):
             # Each staging row carries its own trigger_state (default "Approved")
             trigger_state = payload.get("trigger_state") or "Approved"
 
-            if current_state != trigger_state:
+            if not force and current_state != trigger_state:
                 print(f"[CHECK_WORKFLOW] Skipping {staging_doc.name} — state '{current_state}' != trigger '{trigger_state}'")
                 continue
 
             # Idempotency: skip if document was already in trigger_state before this save
-            if doc_before and prev_state == trigger_state:
+            if not force and doc_before and prev_state == trigger_state:
                 print(f"[CHECK_WORKFLOW] Skipping {staging_doc.name} — was already '{trigger_state}' (idempotency guard)")
                 continue
 
@@ -1626,8 +1636,37 @@ def check_workflow_and_publish(doc, method=None):
                         print(f"[CHECK_WORKFLOW] IGF: resolved project_no={project_no} from igf_project_title={igf_project_title}")
                         payload["project_name"] = project_no
 
+            # Link a follow-up commit (e.g. Direct Purchase PO commit) to the first one:
+            # the earlier PUBLISHED row for the same document, staged on a different trigger_state.
+            if trigger_state != "Approved" and not payload.get("ref_details"):
+                for prev in frappe.get_all("Kafka Commit Staging", filters={
+                    "reference_doctype": doc.doctype,
+                    "reference_name": doc.name,
+                    "status": "PUBLISHED",
+                }, fields=["name", "payload"], order_by="creation asc"):
+                    try:
+                        prev_payload = json.loads(prev.payload or "{}")
+                    except Exception:
+                        continue
+                    if (prev_payload.get("trigger_state") or "Approved") != trigger_state:
+                        payload["ref_details"] = prev_payload.get("ref_details") or prev_payload.get("frap_app_id")
+                        payload["parent_staging"] = prev.name
+                        staging_doc.db_set("payload", json.dumps(payload))
+                        print(f"[CHECK_WORKFLOW] Linked {staging_doc.name} to first commit {prev.name}")
+                        break
+
             # Pass moduleId override from payload so ICSS PO re-commit uses module 14
             module_id_override = payload.get("moduleId") or payload.get("module_id")
+
+            # Direct Purchase PO-stage commit (trigger POGenerated, or legacy "<DP>-po" row)
+            # goes out under the dp_po module (Module Registry idx 29), not Direct Purchase (9).
+            if (
+                not module_id_override
+                and doc.doctype == "Direct Purchase"
+                and (trigger_state == "POGenerated" or str(staging_doc.reference_name or "").endswith("-po"))
+            ):
+                from rndopsapp.rndopsapp.kafka.producer.reimbursement.mapper import get_module_id
+                module_id_override = get_module_id("dp_po") or 29
 
             # Publish to Kafka
             success = kafka_publish_commit(
@@ -1659,6 +1698,7 @@ def check_workflow_and_publish(doc, method=None):
             else:
                 staging_doc.db_set("status", "FAILED")
                 staging_doc.db_set("error_message", "kafka_publish_commit returned False")
+                failed.append(staging_doc.name)
                 print(f"[CHECK_WORKFLOW] Staging doc {staging_doc.name} marked FAILED (returned False)")
                 _mm_notify(
                     f":x: **Kafka Commit FAILED**\n"
@@ -1673,6 +1713,9 @@ def check_workflow_and_publish(doc, method=None):
             frappe.log_error(frappe.get_traceback(), "Process Staged Commit Error")
             staging_doc.db_set("status", "FAILED")
             staging_doc.db_set("error_message", str(e))
+            failed.append(staging_doc.name)
+
+    return failed
 
 
 @frappe.whitelist()
