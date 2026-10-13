@@ -45,3 +45,7 @@ local_settings.py
 # Kafka consumer log rotations (don't match *.log above)
 rndopsapp/rndopsapp/kafka/logs/files/consumer.log.1
 rndopsapp/rndopsapp/kafka/logs/files/consumer.log.2
+# Kafka consumer logs - rotating runtime output, never commit.
+# These were committed once (~20MB) and churn constantly, so they conflict
+# on every deploy. logger.py and __init__.py stay tracked; only output goes.
+rndopsapp/rndopsapp/kafka/logs/files/
