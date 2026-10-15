@@ -129,9 +129,19 @@ def notifyMattermost(String msg) {
         set -uo pipefail
         R=/home/rndadmin/deploy-config/notify-recipients.json
 
-        mapfile -t targets < <(jq -r '.mattermost_dm[]?' "$R")
+        # Force a leading @ on every DM target. Mattermost's webhook "channel"
+        # field treats a bare name as a CHANNEL and only an @-prefixed one as a
+        # direct message, so a bare entry either fails to deliver or posts into
+        # an unrelated channel that happens to share the name. Five of the
+        # first eight entries written by hand were bare, so normalising here
+        # rather than trusting the file is the difference between working and
+        # silently not.
+        mapfile -t targets < <(jq -r '.mattermost_dm[]? | if startswith("@") then . else "@" + . end' "$R")
+
+        # A channel, by contrast, must NOT be @-prefixed - hence the separate
+        # field rather than one list with a convention to remember.
         ch=$(jq -r '.mattermost_channel // ""' "$R")
-        if [ -n "$ch" ]; then targets+=("$ch"); fi
+        if [ -n "$ch" ]; then targets+=("${ch#@}"); fi
 
         if [ "${#targets[@]}" -eq 0 ]; then
           echo "FATAL: mattermost_dm is empty in $R - nobody would be messaged."
