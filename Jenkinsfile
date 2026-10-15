@@ -144,7 +144,14 @@ def notifyMattermost(String msg) {
           # jq builds the JSON, so a commit subject containing a quote,
           # backslash or newline cannot produce a malformed payload.
           payload=$(jq -n --arg ch "$t" --arg txt "$NOTIFY_MSG" '{channel:$ch, text:$txt}')
-          if curl -fsS --max-time 15 -X POST -H 'Content-Type: application/json' \
+          # -L with --post301/--post302: Mattermost builds webhook URLs from its
+          # configured Site URL, which is not necessarily the address reachable
+          # from this host, so the URL it hands out may redirect. Plain curl
+          # downgrades a followed POST to a GET, and Mattermost rejects GET on a
+          # webhook - so without this the DM silently never arrives while the
+          # build still looks fine.
+          if curl -fsS -L --post301 --post302 --max-time 15 \
+               -X POST -H 'Content-Type: application/json' \
                --data-binary "$payload" "$MM_HOOK" >/dev/null; then
             ok=$((ok + 1))
           else
