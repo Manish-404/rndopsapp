@@ -49,3 +49,7 @@ rndopsapp/rndopsapp/kafka/logs/files/consumer.log.2
 # These were committed once (~20MB) and churn constantly, so they conflict
 # on every deploy. logger.py and __init__.py stay tracked; only output goes.
 rndopsapp/rndopsapp/kafka/logs/files/
+
+# Local server migration scripts.
+rndopsapp/scripts/01_source_prepare.sh
+rndopsapp/scripts/02_target_install.sh
